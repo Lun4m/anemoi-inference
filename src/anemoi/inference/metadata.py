@@ -913,6 +913,7 @@ class Metadata(PatchMixin, LegacyMixin):
             set(self._config.data.forcing)
             - set(self.model_computed_variables)
             - set(forcing_variables)
+            - set(self.accumulations)
             - provided_variables
         )
         if not remaining:
