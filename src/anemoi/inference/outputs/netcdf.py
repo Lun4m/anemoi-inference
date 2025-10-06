@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import datetime
 import logging
 import os
 import threading
@@ -15,11 +16,9 @@ from pathlib import Path
 import numpy as np
 
 from anemoi.inference.context import Context
-from anemoi.inference.types import ProcessorConfig
-from anemoi.inference.types import State
+from anemoi.inference.types import ProcessorConfig, State
 
-from ..decorators import ensure_path
-from ..decorators import main_argument
+from ..decorators import ensure_path, main_argument
 from ..output import Output
 from . import output_registry
 
@@ -86,6 +85,8 @@ class NetCDFOutput(Output):
             self.extra_time = 1
         else:
             self.extra_time = 0
+        self.vars = {}
+        self.template = None  # Add this one line so open() won't crash
 
     def __repr__(self) -> str:
         """Return a string representation of the NetCDFOutput object."""
@@ -99,40 +100,53 @@ class NetCDFOutput(Output):
         state : State
             The state dictionary.
         """
+        import datetime
+
         from netCDF4 import Dataset
 
-        with LOCK:
-            if self.ncfile is not None:
-                return
+        # Try to get template path from context
+        template_path = getattr(self.context, "output_template", None) or getattr(
+            getattr(self.context, "development_hacks", {}), "output_template", None
+        )
 
-        # If the file exists, we may get a 'Permission denied' error
-        if os.path.exists(self.path):
-            os.remove(self.path)
+        if template_path is not None and os.path.exists(template_path):
+            LOG.info(f"📄 Using output template: {template_path}")
+            with Dataset(template_path) as tmpl:
+                values = len(tmpl.dimensions["values"])
+                latitudes = tmpl.variables["latitude"][:]
+                longitudes = tmpl.variables["longitude"][:]
+        else:
+            LOG.info("⚠️ No template provided, falling back to state lat/lon")
+            values = len(state["latitudes"])
+            latitudes = state["latitudes"]
+            longitudes = state["longitudes"]
 
-        with LOCK:
-            self.ncfile = Dataset(self.path, "w", format="NETCDF4")
+        LOG.info(f"📏 NetCDFOutput.open: values={values}")
 
         state = self.post_process(state)
 
         compression = {}  # dict(zlib=False, complevel=0)
 
-        values = len(state["latitudes"])
+        # Create new NetCDF file at self.path
+        self.ncfile = Dataset(self.path, "w", format="NETCDF4")
 
-        time = 0
-        self.reference_date = state["date"]
-        if (time_step := getattr(self.context, "time_step", None)) and (
-            lead_time := getattr(self.context, "lead_time", None)
-        ):
-            time = lead_time // time_step
-            time += self.extra_time
+        self.time_var = self.ncfile.createVariable("time", "f8", ("time",))
+        self.lat_var = self.ncfile.createVariable("latitude", "f8", ("values",))
+        self.lon_var = self.ncfile.createVariable("longitude", "f8", ("values",))
+
+        self.time_var.units = "seconds since 1970-01-01 00:00:00"
+        self.lat_var.units = "degrees_north"
+        self.lon_var.units = "degrees_east"
 
         if reference_date := getattr(self.context, "reference_date", None):
             self.reference_date = reference_date
 
         with LOCK:
             self.values_dim = self.ncfile.createDimension("values", values)
-            self.time_dim = self.ncfile.createDimension("time", time)
-            self.time_var = self.ncfile.createVariable("time", "i4", ("time",), **compression)
+            self.time_dim = self.ncfile.createDimension("time", None)
+            self.time_var = self.ncfile.createVariable(
+                "time", "i4", ("time",), **compression
+            )
 
             self.time_var.units = f"seconds since {self.reference_date}"
             self.time_var.long_name = "time"
@@ -141,13 +155,17 @@ class NetCDFOutput(Output):
         with LOCK:
             latitudes = state["latitudes"]
 
-            self.latitude_var = self.ncfile.createVariable("latitude", self.float_size, ("values",), **compression)
+            self.latitude_var = self.ncfile.createVariable(
+                "latitude", self.float_size, ("values",), **compression
+            )
             self.latitude_var.units = "degrees_north"
             self.latitude_var.long_name = "latitude"
 
             longitudes = state["longitudes"]
 
-            self.longitude_var = self.ncfile.createVariable("longitude", self.float_size, ("values",), **compression)
+            self.longitude_var = self.ncfile.createVariable(
+                "longitude", self.float_size, ("values",), **compression
+            )
             self.longitude_var.units = "degrees_east"
             self.longitude_var.long_name = "longitude"
 
@@ -157,6 +175,28 @@ class NetCDFOutput(Output):
         self.vars = {}
 
         self.n = 0
+
+        # Reference date
+        ref_date = getattr(self.context, "date", None)
+
+        if ref_date is None:
+            dates_obj = getattr(self.context, "dates", None)
+            if dates_obj is not None:
+                ref_date = getattr(dates_obj, "start", None)
+
+        if isinstance(ref_date, str):
+            ref_date = datetime.datetime.fromisoformat(ref_date)
+
+        if ref_date is None:
+            # fallback: use state date
+            ref_date = state["date"]
+
+        self.reference_date = ref_date
+
+        LOG.info(f"🕒 Reference date set to {self.reference_date}")
+        LOG.info(
+            f"✅ Created NetCDF file {self.path} with dimensions: time=unlimited, values={values}"
+        )
 
     def ensure_variables(self, state: State) -> None:
         """Ensure that all variables are created in the NetCDF file.
@@ -198,6 +238,40 @@ class NetCDFOutput(Output):
                 self.vars[name].fill_value = missing_value
                 self.vars[name].missing_value = missing_value
 
+    def ensure_variables(self, state: State) -> None:
+        """Ensure that all variables are created in the NetCDF file.
+
+        Parameters
+        ----------
+        state : State
+            The state dictionary.
+        """
+        # Use the dimension already defined in open()
+        values = len(self.ncfile.dimensions["values"])
+        compression = {}  # dict(zlib=False, complevel=0)
+
+        for name in state["fields"].keys():
+            if name in self.vars:
+                continue
+            chunksizes = (1, min(values, 100000))
+
+            while np.prod(chunksizes) > 1000000:
+                chunksizes = tuple(int(np.ceil(x / 2)) for x in chunksizes)
+
+            with LOCK:
+                missing_value = self.missing_value
+
+                self.vars[name] = self.ncfile.createVariable(
+                    name,
+                    self.float_size,
+                    ("time", "values"),
+                    fill_value=missing_value,
+                    **compression,
+                )
+
+                self.vars[name].fill_value = missing_value
+                self.vars[name].missing_value = missing_value
+
     def write_step(self, state: State) -> None:
         """Write the state.
 
@@ -209,7 +283,9 @@ class NetCDFOutput(Output):
 
         self.ensure_variables(state)
 
-        step = state["date"] - self.reference_date
+        # Store absolute time since 1970 (not relative to reference_date)
+        epoch = datetime.datetime(1970, 1, 1)
+        step = state["date"] - epoch
         self.time_var[self.n] = step.total_seconds()
 
         for name, value in state["fields"].items():
